@@ -1,212 +1,156 @@
-// SPDX-License-Identifier: MIT
-// OpenZeppelin Contracts (last updated v5.2.0) (token/ERC20/utils/SafeERC20.sol)
+// SPDX-License-Identifier: UNLICENSED 
+pragma solidity =0.6.6;
 
-pragma solidity ^0.8.20;
+// Uniswap interface and library imports
+import "./interfaces/IUniswapV2Factory.sol";
+import "./interfaces/IUniswapV2Pair.sol";
+import "./interfaces/IUniswapV2Router01.sol";
+import "./interfaces/IUniswapV2Router02.sol";
+import "./interfaces/IERC20.sol";
+import "./libraries/UniswapV2Library.sol";
+// Correcting the SafeERC20 import from OpenZeppelin
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "hardhat/console.sol";
 
-import {IERC20} from "../IERC20.sol";
-import {IERC1363} from "../../../interfaces/IERC1363.sol";
+// Ownable import for restricting contract functions
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-/**
- * @title SafeERC20
- * @dev Wrappers around ERC-20 operations that throw on failure (when the token
- * contract returns false). Tokens that return no value (and instead revert or
- * throw on failure) are also supported, non-reverting calls are assumed to be
- * successful.
- * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
- * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
- */
-library SafeERC20 {
-    /**
-     * @dev An operation with an ERC-20 token failed.
-     */
-    error SafeERC20FailedOperation(address token);
+contract FlashLoan is Ownable {
+    using SafeERC20 for IERC20;
 
-    /**
-     * @dev Indicates a failed `decreaseAllowance` request.
-     */
-    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+    // Factory and Routing Addresses
+    address private constant PANCAKE_FACTORY = 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73;
+    address private constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
 
-    /**
-     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
-     * non-reverting calls are assumed to be successful.
-     */
-    function safeTransfer(IERC20 token, address to, uint256 value) internal {
-        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    // Token Addresses
+    address private constant BUSD = 0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56;
+    address private constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+    address private constant CROX = 0x2c094F5A7D1146BB93850f629501eB749f6Ed491;
+    address private constant CAKE = 0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82;
+
+    uint256 private deadline = block.timestamp + 1 days;
+    uint256 private constant MAX_INT = 115792089237316195423570985008687907853269984665640564039457584007913129639935;
+
+    // Reentrancy guard
+    bool private lock = false;
+
+    // Time lock variables
+    uint256 private lastActionTime;
+    uint256 public constant COOLDOWN_TIME = 1 hours;
+
+    modifier nonReentrant() {
+        require(!lock, "ReentrancyGuard: reentrant call");
+        lock = true;
+        _;
+        lock = false;
     }
 
-    /**
-     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
-     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
-     */
-    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
-        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    modifier onlyAfterCooldown() {
+        require(block.timestamp >= lastActionTime + COOLDOWN_TIME, "Cooldown: Try again later");
+        _;
     }
 
-    /**
-     * @dev Variant of {safeTransfer} that returns a bool instead of reverting if the operation is not successful.
-     */
-    function trySafeTransfer(IERC20 token, address to, uint256 value) internal returns (bool) {
-        return _callOptionalReturnBool(token, abi.encodeCall(token.transfer, (to, value)));
+    // Check if trade is profitable
+    function checkResult(uint _repayAmount, uint _acquiredCoin) pure private returns (bool) {
+        return _acquiredCoin > _repayAmount;
     }
 
-    /**
-     * @dev Variant of {safeTransferFrom} that returns a bool instead of reverting if the operation is not successful.
-     */
-    function trySafeTransferFrom(IERC20 token, address from, address to, uint256 value) internal returns (bool) {
-        return _callOptionalReturnBool(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    // Get contract balance of a specific token
+    function getBalanceOfToken(address _address) public view returns (uint256) {
+        return IERC20(_address).balanceOf(address(this));
     }
 
-    /**
-     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
-     * non-reverting calls are assumed to be successful.
-     *
-     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the "client"
-     * smart contract uses ERC-7674 to set temporary allowances, then the "client" smart contract should avoid using
-     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract
-     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.
-     */
-    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
-        uint256 oldAllowance = token.allowance(address(this), spender);
-        forceApprove(token, spender, oldAllowance + value);
-    }
-
-    /**
-     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
-     * value, non-reverting calls are assumed to be successful.
-     *
-     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the "client"
-     * smart contract uses ERC-7674 to set temporary allowances, then the "client" smart contract should avoid using
-     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract
-     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.
-     */
-    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
-        unchecked {
-            uint256 currentAllowance = token.allowance(address(this), spender);
-            if (currentAllowance < requestedDecrease) {
-                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
-            }
-            forceApprove(token, spender, currentAllowance - requestedDecrease);
+    // Approve tokens only once
+    function approveTokens(address _token, address _spender, uint256 _amount) private {
+        uint256 currentAllowance = IERC20(_token).allowance(address(this), _spender);
+        if (currentAllowance < _amount) {
+            IERC20(_token).safeApprove(_spender, 0);
+            IERC20(_token).safeApprove(_spender, MAX_INT);
         }
     }
 
-    /**
-     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
-     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
-     * to be set to zero before setting it to a non-zero value, such as USDT.
-     *
-     * NOTE: If the token implements ERC-7674, this function will not modify any temporary allowance. This function
-     * only sets the "standard" allowance. Any temporary allowance will remain active, in addition to the value being
-     * set here.
-     */
-    function forceApprove(IERC20 token, address spender, uint256 value) internal {
-        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
-
-        if (!_callOptionalReturnBool(token, approvalCall)) {
-            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
-            _callOptionalReturn(token, approvalCall);
-        }
+    // External call to trusted price oracle or trusted contract to verify market price
+    function verifyPrice(address _fromToken, address _toToken, uint256 _amountIn) private view returns (uint256) {
+        // Price check logic can include using an oracle like Chainlink or any trusted price source
+        uint256 price = IUniswapV2Router01(PANCAKE_ROUTER).getAmountsOut(_amountIn, [_fromToken, _toToken])[1];
+        return price;
     }
 
-    /**
-     * @dev Performs an {ERC1363} transferAndCall, with a fallback to the simple {ERC20} transfer if the target has no
-     * code. This can be used to implement an {ERC721}-like safe transfer that rely on {ERC1363} checks when
-     * targeting contracts.
-     *
-     * Reverts if the returned value is other than `true`.
-     */
-    function transferAndCallRelaxed(IERC1363 token, address to, uint256 value, bytes memory data) internal {
-        if (to.code.length == 0) {
-            safeTransfer(token, to, value);
-        } else if (!token.transferAndCall(to, value, data)) {
-            revert SafeERC20FailedOperation(address(token));
-        }
+    // Execute trade with slippage protection
+    function placeTrade(address _fromToken, address _toToken, uint _amountIn, uint _slippage) private returns (uint) {
+        address pair = IUniswapV2Factory(PANCAKE_FACTORY).getPair(_fromToken, _toToken);
+        require(pair != address(0), "Pool does not exist");
+
+        // Calculate Amount Out with slippage protection
+        uint256 amountRequired = IUniswapV2Router01(PANCAKE_ROUTER).getAmountsOut(_amountIn, [_fromToken, _toToken])[1];
+        uint256 slippageAmount = (amountRequired * _slippage) / 100;
+        uint256 amountWithSlippage = amountRequired + slippageAmount;
+
+        uint256 price = verifyPrice(_fromToken, _toToken, _amountIn);
+        require(price >= amountRequired, "Price manipulation detected: Price mismatch");
+
+        uint256 amountReceived = IUniswapV2Router01(PANCAKE_ROUTER)
+            .swapExactTokensForTokens(_amountIn, amountWithSlippage, [_fromToken, _toToken], address(this), deadline)[1];
+
+        require(amountReceived > 0, "Transaction Abort");
+
+        return amountReceived;
     }
 
-    /**
-     * @dev Performs an {ERC1363} transferFromAndCall, with a fallback to the simple {ERC20} transferFrom if the target
-     * has no code. This can be used to implement an {ERC721}-like safe transfer that rely on {ERC1363} checks when
-     * targeting contracts.
-     *
-     * Reverts if the returned value is other than `true`.
-     */
-    function transferFromAndCallRelaxed(
-        IERC1363 token,
-        address from,
-        address to,
-        uint256 value,
-        bytes memory data
-    ) internal {
-        if (to.code.length == 0) {
-            safeTransferFrom(token, from, to, value);
-        } else if (!token.transferFromAndCall(from, to, value, data)) {
-            revert SafeERC20FailedOperation(address(token));
-        }
+    // Initiate Arbitrage using Flash Loan
+    function initiateArbitrage(address _busdBorrow, uint _amount, uint _slippage) external nonReentrant onlyAfterCooldown {
+        approveTokens(BUSD, PANCAKE_ROUTER, MAX_INT);
+        approveTokens(CROX, PANCAKE_ROUTER, MAX_INT);
+        approveTokens(CAKE, PANCAKE_ROUTER, MAX_INT);
+
+        // Liquidity pool of BUSD and WBNB
+        address pair = IUniswapV2Factory(PANCAKE_FACTORY).getPair(_busdBorrow, WBNB);
+        require(pair != address(0), "Pool does not exist");
+
+        address token0 = IUniswapV2Pair(pair).token0(); // WBNB
+        address token1 = IUniswapV2Pair(pair).token1(); // BUSD
+
+        uint amount0Out = _busdBorrow == token0 ? _amount : 0;
+        uint amount1Out = _busdBorrow == token1 ? _amount : 0;
+
+        bytes memory data = abi.encode(_busdBorrow, _amount, msg.sender);
+        IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), data);
+
+        lastActionTime = block.timestamp;
     }
 
-    /**
-     * @dev Performs an {ERC1363} approveAndCall, with a fallback to the simple {ERC20} approve if the target has no
-     * code. This can be used to implement an {ERC721}-like safe transfer that rely on {ERC1363} checks when
-     * targeting contracts.
-     *
-     * NOTE: When the recipient address (`to`) has no code (i.e. is an EOA), this function behaves as {forceApprove}.
-     * Opposedly, when the recipient address (`to`) has code, this function only attempts to call {ERC1363-approveAndCall}
-     * once without retrying, and relies on the returned value to be true.
-     *
-     * Reverts if the returned value is other than `true`.
-     */
-    function approveAndCallRelaxed(IERC1363 token, address to, uint256 value, bytes memory data) internal {
-        if (to.code.length == 0) {
-            forceApprove(token, to, value);
-        } else if (!token.approveAndCall(to, value, data)) {
-            revert SafeERC20FailedOperation(address(token));
-        }
-    }
+    // PancakeSwap callback function after flash loan
+    function pancakeCall(
+        address _sender,
+        uint256 _amount0,
+        uint256 _amount1,
+        bytes calldata _data
+    ) external {
+        address token0 = IUniswapV2Pair(msg.sender).token0();
+        address token1 = IUniswapV2Pair(msg.sender).token1();
+        address pair = IUniswapV2Factory(PANCAKE_FACTORY).getPair(token0, token1);
+        require(msg.sender == pair, "The sender needs to match the pair");
+        require(_sender == address(this), "Sender should match the contract");
 
-    /**
-     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
-     * on the return value: the return value is optional (but if data is returned, it must not be false).
-     * @param token The token targeted by the call.
-     * @param data The call data (encoded using abi.encode or one of its variants).
-     *
-     * This is a variant of {_callOptionalReturnBool} that reverts if call fails to meet the requirements.
-     */
-    function _callOptionalReturn(IERC20 token, bytes memory data) private {
-        uint256 returnSize;
-        uint256 returnValue;
-        assembly ("memory-safe") {
-            let success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)
-            // bubble errors
-            if iszero(success) {
-                let ptr := mload(0x40)
-                returndatacopy(ptr, 0, returndatasize())
-                revert(ptr, returndatasize())
-            }
-            returnSize := returndatasize()
-            returnValue := mload(0)
-        }
+        // Decode data for calculating the repayment
+        (address busdBorrow, uint256 amount, address myAddress) = abi.decode(_data, (address, uint256, address));
 
-        if (returnSize == 0 ? address(token).code.length == 0 : returnValue != 1) {
-            revert SafeERC20FailedOperation(address(token));
-        }
-    }
+        // Calculate the amount to repay at the end
+        uint256 fee = ((amount * 3) / 997) + 1;
+        uint256 repayAmount = amount + fee;
 
-    /**
-     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
-     * on the return value: the return value is optional (but if data is returned, it must not be false).
-     * @param token The token targeted by the call.
-     * @param data The call data (encoded using abi.encode or one of its variants).
-     *
-     * This is a variant of {_callOptionalReturn} that silently catches all reverts and returns a bool instead.
-     */
-    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
-        bool success;
-        uint256 returnSize;
-        uint256 returnValue;
-        assembly ("memory-safe") {
-            success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)
-            returnSize := returndatasize()
-            returnValue := mload(0)
-        }
-        return success && (returnSize == 0 ? address(token).code.length > 0 : returnValue == 1);
+        // Perform arbitrage
+        uint256 loanAmount = _amount0 > 0 ? _amount0 : _amount1;
+        uint256 trade1Coin = placeTrade(BUSD, CROX, loanAmount, 2);  // Example slippage: 2%
+        uint256 trade2Coin = placeTrade(CROX, CAKE, trade1Coin, 2);
+        uint256 trade3Coin = placeTrade(CAKE, BUSD, trade2Coin, 2);
+
+        // Check Profitability
+        bool profCheck = checkResult(repayAmount, trade3Coin);
+        require(profCheck, "Arbitrage not profitable");
+
+        // Pay profit and loan back
+        IERC20(BUSD).transfer(myAddress, trade3Coin - repayAmount);
+        IERC20(busdBorrow).transfer(pair, repayAmount);
     }
 }
